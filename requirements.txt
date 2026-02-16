@@ -2,3 +2,4 @@ boto3
 langchain
 faiss-cpu
 streamlit
+python-dotenv
