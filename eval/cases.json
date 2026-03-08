@@ -1,0 +1,18 @@
+[
+  {
+    "id": "alb_5xx",
+    "question": "How do I troubleshoot a spike in HTTP 5xx errors on an ALB?",
+    "required_terms": [
+      "CloudWatch"
+    ]
+  },
+  {
+    "id": "rds_cpu",
+    "question": "What should I check when RDS CPU spikes above 80%?",
+    "required_terms": [
+      "slow queries",
+      "CloudWatch",
+      "connections"
+    ]
+  }
+]

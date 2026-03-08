@@ -1,0 +1,244 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Ops Copilot demo (CloudWatch Alarm -> Step Functions -> Approval -> Optional Rollback)
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Default: ""
+    Description: Optional email to receive approval links (SNS). Leave empty to skip subscription.
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref NotificationEmail, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 30
+    MemorySize: 512
+    Environment:
+      Variables:
+        LOG_LEVEL: INFO
+
+Resources:
+  OpsCopilotTopic:
+    Type: AWS::SNS::Topic
+
+  OpsCopilotTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      Protocol: email
+      TopicArn: !Ref OpsCopilotTopic
+      Endpoint: !Ref NotificationEmail
+
+  TriageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: aws_lambda/triage/
+      Handler: app.handler
+      Policies:
+        - AWSLambdaBasicExecutionRole
+
+  ApprovalFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: aws_lambda/approval/
+      Handler: app.handler
+      Timeout: 10
+      MemorySize: 256
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+            - Effect: Allow
+              Action:
+                - states:SendTaskSuccess
+                - states:SendTaskFailure
+              Resource: "*"
+      Events:
+        ApprovalApi:
+          Type: Api
+          Properties:
+            Path: /approval
+            Method: GET
+
+  RollbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: aws_lambda/rollback/
+      Handler: app.handler
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ecs:UpdateService
+              Resource: "*"
+              RollbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: aws_lambda/rollback/
+      Handler: app.handler
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ecs:UpdateService
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - iam:PassRole
+              Resource:
+                - arn:aws:iam::495026846695:role/ecsTaskExecutionRole
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeAndPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt TriageFunction.Arn
+                  - !GetAtt RollbackFunction.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref OpsCopilotTopic
+
+  EventBridgeToSfnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref IncidentStateMachine
+
+  IncidentStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StateMachineRole.Arn
+      DefinitionString:
+        Fn::Sub:
+          - |
+            {
+              "StartAt": "Triage",
+              "States": {
+                "Triage": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": {
+                    "FunctionName": "${TriageArn}",
+                    "Payload.$": "$"
+                  },
+                  "ResultPath": "$.triage",
+                  "Next": "NeedRollback?"
+                },
+                "NeedRollback?": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Variable": "$.triage.Payload.recommendation.action",
+                      "StringEquals": "ECS_ROLLBACK",
+                      "Next": "RequestApproval"
+                    }
+                  ],
+                  "Default": "Done"
+                },
+                "RequestApproval": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::sns:publish.waitForTaskToken",
+                  "TimeoutSeconds": 3600,
+                  "Parameters": {
+                    "TopicArn": "${TopicArn}",
+                    "Subject": "Ops Copilot Approval Required",
+                    "Message.$": "$$.Task.Token"
+                  },
+                  "ResultPath": "$.approval",
+                  "Next": "Approved?"
+                },
+                "Approved?": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Variable": "$.approval.decision",
+                      "StringEquals": "APPROVE",
+                      "Next": "Rollback"
+                    }
+                  ],
+                  "Default": "Done"
+                },
+                "Rollback": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": {
+                    "FunctionName": "${RollbackArn}",
+                    "Payload": {
+                      "cluster.$": "$.cluster",
+                      "service.$": "$.service",
+                      "previous_task_definition.$": "$.previous_task_definition",
+                      "approval.$": "$.approval"
+                    }
+                  },
+                  "ResultPath": "$.rollback",
+                  "Next": "Done"
+                },
+                "Done": {
+                  "Type": "Succeed"
+                }
+              }
+            }
+          - {
+              TriageArn: !GetAtt TriageFunction.Arn,
+              RollbackArn: !GetAtt RollbackFunction.Arn,
+              TopicArn: !Ref OpsCopilotTopic
+            }
+
+  AlarmEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Trigger incident pipeline when any CloudWatch Alarm enters ALARM state
+      EventPattern:
+        source:
+          - aws.cloudwatch
+        detail-type:
+          - CloudWatch Alarm State Change
+        detail:
+          state:
+            value:
+              - ALARM
+      Targets:
+        - Arn: !Ref IncidentStateMachine
+          Id: IncidentStateMachineTarget
+          RoleArn: !GetAtt EventBridgeToSfnRole.Arn
+
+Outputs:
+  StateMachineArn:
+    Value: !Ref IncidentStateMachine
+
+  ApprovalApiUrl:
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/approval"

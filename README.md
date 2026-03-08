@@ -1,205 +1,417 @@
-# 🛠️ Ops Copilot — AI DevOps Runbook Assistant (Amazon Bedrock)
+# Ops Copilot
 
-Ops Copilot is a GenAI-powered DevOps assistant that answers production incident questions using operational runbooks stored in Amazon S3, grounded via Amazon Bedrock Knowledge Bases (RAG) and Titan Embeddings.
+Ops Copilot is an AI-assisted DevOps incident workflow that combines **local RAG over operational runbooks** with an **optional AWS approval-gated remediation pipeline**.
 
-This project demonstrates how platform engineers can build an AI Copilot for on-call operations using fully managed AWS services.
+It has two major parts:
 
----
+1. **Local runbook assistant**
+   - indexes Markdown runbooks into a FAISS vector store
+   - retrieves the most relevant chunks for an operational question
+   - generates grounded answers using **Ollama** by default
+   - supports **AWS Bedrock** as an optional generation backend
 
-## 🚀 Problem Statement
-
-During incidents, engineers spend critical time:
-
-* Searching runbooks
-* Finding rollback steps
-* Checking dashboards
-* Remembering CLI commands
-
-Ops Copilot enables natural language queries like:
-
-> “ALB is returning 5xx after deploy — what should I check?”
-
-And returns grounded answers with citations from real runbooks.
+2. **AWS incident pipeline**
+   - accepts CloudWatch-style alarm events
+   - runs triage through AWS Step Functions and Lambda
+   - requires human approval before risky remediation
+   - can execute ECS rollback to a previous task definition
 
 ---
 
-## 🧠 Architecture Overview
+## Why this project matters
 
-Flow:
+This project is not just a chatbot over docs.
 
-1. Runbooks stored in S3 (Markdown)
-2. Bedrock Knowledge Base parses + chunks documents
-3. Titan Embeddings converts chunks to vectors
-4. Stored in OpenSearch Serverless
-5. RetrieveAndGenerate answers user questions
-6. Streamlit UI displays grounded responses
+It demonstrates how AI can be used in a **guardrailed operational workflow**:
+
+- retrieve the right runbook context
+- recommend the next action
+- pause for human approval
+- trigger controlled remediation
+- keep rollback explicit and auditable
+
+That makes it much closer to a realistic incident-response automation pattern than a simple Q&A demo.
 
 ---
 
-## 📊 Architecture Diagram
+## Core capabilities
+
+### Local RAG assistant
+- Ingests Markdown runbooks from `data/`
+- Builds embeddings with `sentence-transformers`
+- Stores vectors in **FAISS**
+- Retrieves relevant chunks for a question
+- Generates grounded answers with source references
+- Includes a small evaluation harness for repeatable validation
+
+### AWS workflow
+- CloudWatch alarm style event ingestion
+- Step Functions orchestration
+- Triage Lambda for routing
+- SNS approval gate
+- Approval API callback
+- Rollback Lambda for ECS service rollback
+- Safe behavior when rollback context is missing
+
+---
+
+## Architecture
+
+### 1) Local RAG flow
 
 ```mermaid
 flowchart LR
-  U[User] --> UI[Streamlit UI]
-  UI --> RAG[Bedrock RetrieveAndGenerate]
-  RAG --> KB[Bedrock Knowledge Base]
-  KB --> S3[(S3 Runbooks)]
-  KB --> EMB[Titan Embeddings]
-  EMB --> OS[(OpenSearch Serverless Vector Store)]
-  OS --> KB
-  KB --> RAG
-  RAG --> UI
+    A[Markdown Runbooks in data/] --> B[Chunking and Ingestion]
+    B --> C[Embeddings via sentence-transformers]
+    C --> D[FAISS Index in index/]
+
+    U[User Question in Streamlit] --> E[Retriever]
+    D --> E
+    E --> F[Prompt Builder with Retrieved Context]
+    F --> G[LLM Generation]
+    G --> H[Ollama default]
+    G -. optional .-> I[AWS Bedrock]
+    H --> J[Grounded Answer]
+    I --> J
+
+    K[Eval cases in eval/] --> L[Evaluation Runner]
+    D --> L
+    L --> M[Pass/Fail checks]
+```
+
+### 2) AWS incident pipeline
+
+```mermaid
+flowchart TD
+    A[CloudWatch Alarm or Test Event] --> B[EventBridge Rule]
+    B --> C[Step Functions State Machine]
+
+    C --> D[Triage Lambda]
+    D --> E{Rollback needed?}
+
+    E -- No --> F[Done]
+    E -- Yes --> G[SNS Approval Request]
+
+    G --> H[Human approves through Approval API]
+    H --> I[Approval Lambda sends callback success]
+
+    I --> C
+    C --> J[Rollback Lambda]
+    J --> K[ECS UpdateService to previous task definition]
+    K --> L[Service rolled back]
+```
+
+### 3) End-to-end demo flow
+
+```mermaid
+flowchart TD
+    A[Runbooks] --> B[FAISS Index]
+    C[Streamlit UI] --> D[Retrieve Relevant Chunks]
+    B --> D
+    D --> E[LLM Answer Generation]
+    E --> F[Grounded Ops Answer]
+
+    G[Alarm Event JSON] --> H[Step Functions]
+    H --> I[Triage Lambda]
+    I --> J{Needs rollback?}
+    J -- No --> K[Done]
+    J -- Yes --> L[SNS Approval]
+    L --> M[Approval API]
+    M --> N[Rollback Lambda]
+    N --> O[ECS Service rollback]
 ```
 
 ---
 
-## 📂 Repository Structure
+## Repository structure
 
-```
-ops-copilot-bedrock/
-│
-├── data/        # Sample runbooks
-├── src/         # Bedrock scripts
-├── infra/       # IAM + architecture docs
-├── diagrams/    # Solution images
-├── blog/        # Blog drafts
-│
-├── app.py       # Streamlit UI
-├── requirements.txt
-└── README.md
+```text
+.
+├─ app.py
+├─ run_all.bat
+├─ requirements.txt
+├─ README.md
+├─ data/                       # Markdown runbooks
+├─ index/                      # Generated local artifacts
+├─ src/
+│  ├─ __init__.py
+│  ├─ config.py
+│  ├─ embed_local.py
+│  ├─ query.py
+│  ├─ llm_generate.py
+│  ├─ local_llm.py
+│  ├─ build_index.py
+│  └─ ingest.py
+├─ eval/
+│  ├─ __init__.py
+│  ├─ cases.json
+│  └─ run_eval.py
+└─ infra/
+   ├─ template.yaml
+   ├─ samconfig.toml
+   └─ aws_lambda/
+      ├─ triage/
+      ├─ approval/
+      └─ rollback/
 ```
 
 ---
 
-## 🛠️ AWS Services Used
+## Tech stack
 
-* Amazon Bedrock
-* Bedrock Knowledge Bases
-* Titan Embeddings
-* OpenSearch Serverless
-* Amazon S3
-* AWS IAM
-* Streamlit (UI)
+- Python
+- Streamlit
+- FAISS
+- sentence-transformers
+- Ollama
+- AWS Lambda
+- AWS Step Functions
+- AWS SNS
+- Amazon ECS
+- AWS SAM
 
 ---
 
-## ⚙️ Setup Instructions
+## Local quickstart
 
-### 1️⃣ Install dependencies
+### Prerequisites
+- Python 3.10+
+- Ollama installed and running
+
+### Create virtual environment
+
+```bash
+python -m venv .venv
+```
+
+Windows:
+
+```bash
+.venv\Scripts\activate
+```
+
+macOS/Linux:
+
+```bash
+source .venv/bin/activate
+```
+
+### Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
----
-
-### 2️⃣ Configure environment variables
-
-Create `.env` or export manually:
+### Configure environment
 
 ```bash
-export AWS_REGION=us-east-1
-export KB_ID=YOUR_KNOWLEDGE_BASE_ID
-export MODEL_ID=amazon.nova-lite-v1:0
+copy .env.example .env
 ```
 
-Windows PowerShell:
+or on macOS/Linux:
 
-```powershell
-setx AWS_REGION us-east-1
-setx KB_ID your_kb_id
-setx MODEL_ID amazon.nova-lite-v1:0
+```bash
+cp .env.example .env
 ```
 
----
+Default local mode:
 
-### 3️⃣ Run the Streamlit UI
+```env
+LLM_PROVIDER=ollama
+OLLAMA_HOST=http://localhost:11434
+OLLAMA_MODEL=llama3.2:3b
+```
+
+### Add runbooks
+
+Put Markdown runbooks into:
+
+```text
+data/
+```
+
+### Build the FAISS index
+
+```bash
+python -m src.build_index --data-dir data --index-dir index
+```
+
+### Run evaluation
+
+```bash
+python -m eval.run_eval
+```
+
+### Start the Streamlit app
 
 ```bash
 streamlit run app.py
 ```
 
-Open browser → http://localhost:8501
-
 ---
 
-## 💬 Example Questions
+## One-command local runner
 
-* “ALB is returning 5xx — what should I check first?”
-* “How do I rollback an ECS deployment?”
-* “RDS CPU spike troubleshooting steps?”
-* “Which CloudWatch metrics should I verify?”
+For Windows CMD:
 
----
-
-## 🔐 IAM Permissions Required
-
-Knowledge Base execution role must allow:
-
-* `bedrock:InvokeModel`
-* `bedrock:Retrieve`
-* `bedrock:RetrieveAndGenerate`
-* S3 read access
-* OpenSearch access
-
-Sample policy available in:
-
+```bash
+run_all.bat
 ```
-infra/iam-policy.json
+
+This script can:
+- create and activate a virtual environment
+- install dependencies
+- build the local index
+- run evaluation
+- check Ollama
+- optionally build and deploy the AWS SAM stack
+- start Streamlit
+
+To enable SAM deployment inside the batch run:
+
+```bash
+set DEPLOY_SAM=1
+run_all.bat
 ```
 
 ---
 
-## 💰 Cost Awareness
+## AWS deployment
 
-| Service               | Cost Behavior            |
-| --------------------- | ------------------------ |
-| S3                    | Very low cost            |
-| Bedrock embeddings    | Pay per use              |
-| Knowledge Base        | Active infra             |
-| OpenSearch Serverless | Always-on (primary cost) |
+From `infra/`:
 
-### Portfolio Best Practice
-
-Deploy → Demo → Capture screenshots → Delete infra → Recreate when needed
-
----
-
-## 🧪 Sample Runbooks Included
-
-Located in:
-
-```
-/data
+```bash
+sam validate --template-file template.yaml
+sam build --template-file template.yaml
+sam deploy --guided --template-file .aws-sam/build/template.yaml
 ```
 
-Runbooks:
-
-* ALB 5xx troubleshooting
-* ECS rollback
-* RDS CPU spike investigation
+After deploy, note these stack outputs:
+- `StateMachineArn`
+- `ApprovalApiUrl`
 
 ---
 
-## 🧱 Future Enhancements
+## Demo flow
 
-* Slack / Teams bot integration
-* Incident auto-remediation
-* CloudWatch alarm triggers
-* Terraform deployment
-* Multi-account runbook indexing
+### Start a test execution
+
+```bash
+aws stepfunctions start-execution \
+  --region us-east-1 \
+  --state-machine-arn <StateMachineArn> \
+  --name demo-123 \
+  --input file://test_alarm_ecs.json
+```
+
+### Approve a rollback
+
+```bash
+curl -G "<ApprovalApiUrl>" \
+  --data-urlencode "decision=APPROVE" \
+  --data-urlencode "token=<TOKEN>"
+```
+
+### ECS rollback input
+For a real rollback demo, the input must include:
+
+```json
+{
+  "cluster": "ops-copilot-demo-cluster",
+  "service": "ops-copilot-demo-service",
+  "previous_task_definition": "ops-copilot-demo:1"
+}
+```
 
 ---
 
-## 🧑‍💻 Author
+## Evaluation
 
-**Sankar TK**
-AWS DevOps Engineer
+The evaluation harness validates grounded answers for sample operational scenarios such as:
+- ALB 5xx spike triage
+- RDS CPU spike triage
 
-GitHub: https://github.com/Sankartk
+Run:
+
+```bash
+python -m eval.run_eval
+```
+
+Results are written to:
+
+```text
+eval/eval_results.json
+```
 
 ---
 
-## 📜 License
+## Guardrails and safety
 
-MIT License
+This project intentionally includes operational guardrails:
+
+- grounded answers from retrieved runbook context
+- explicit approval before rollback
+- rollback skipped unless required ECS context is provided
+- rollback Lambda limited to ECS update actions
+- human-in-the-loop control for risky remediation
+
+---
+
+## What this project demonstrates
+
+This project demonstrates practical experience with:
+
+- Retrieval-Augmented Generation
+- vector search with FAISS
+- prompt grounding and answer constraints
+- local LLM integration with Ollama
+- optional cloud inference with Bedrock
+- AWS Lambda
+- AWS Step Functions
+- SNS approval workflows
+- ECS rollback orchestration
+- infrastructure deployment with AWS SAM
+
+---
+
+## Limitations
+
+- Retrieval quality depends on runbook quality and chunking strategy
+- Routing logic is heuristic-based, not a learned classifier
+- Approval flow is email plus token callback, not Slack or SSO integrated
+- Demo rollback uses explicit ECS context rather than automated discovery
+- This is a portfolio/demo project, not a production incident platform
+
+---
+
+## Future improvements
+
+- Better reranking and retrieval quality
+- Slack / Teams approval integration
+- Richer observability dashboards
+- Automatic rollback context discovery
+- Support for more remediation actions beyond ECS rollback
+- Safer IAM scoping for ECS and pass-role permissions
+- UI for execution history and approval actions
+
+---
+
+## Cost note
+
+Local mode is effectively free beyond local machine resources.
+
+The AWS demo uses paid AWS services such as:
+- Lambda
+- Step Functions
+- SNS
+- API Gateway
+- EventBridge
+- ECS Fargate for rollback demo
+
+For short-lived demos, cost is usually very low, but not zero. Delete ECS and stack resources after testing.
+
+---
+
+## License
+
+Add a license of your choice, such as MIT.

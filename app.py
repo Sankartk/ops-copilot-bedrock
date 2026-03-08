@@ -1,128 +1,63 @@
-# app.py
-import os
-import json
 import streamlit as st
-import boto3
-from botocore.exceptions import ClientError
 from dotenv import load_dotenv
+
+from src.config import Settings
+from src.embed_local import embed_text
+from src.query import retrieve, filter_hits_by_query, format_sources_markdown, build_prompt
+from src.llm_generate import generate_answer
 
 load_dotenv()
 
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-DEFAULT_KB_ID = os.getenv("KB_ID", "")
-DEFAULT_MODEL_ID = os.getenv("MODEL_ID", "amazon.nova-lite-v1:0")  # can be model id OR full ARN
 
-st.set_page_config(page_title="Ops Copilot", page_icon="🛠️", layout="centered")
+def main():
+    st.set_page_config(page_title="Ops Copilot", page_icon="🛠️", layout="wide")
 
-st.title("Ops Copilot — AI Runbook Assistant")
-st.caption("Ask DevOps incident questions grounded in your runbooks via Amazon Bedrock Knowledge Bases.")
+    settings = Settings.from_env()
 
-with st.sidebar:
-    st.header("Configuration")
-    aws_region = st.text_input("AWS Region", value=AWS_REGION)
-    kb_id = st.text_input("Knowledge Base ID (KB_ID)", value=DEFAULT_KB_ID, placeholder="e.g., KBNNNNNNNN")
-    model_id_or_arn = st.text_input(
-        "Model ID or ARN (MODEL_ID)",
-        value=DEFAULT_MODEL_ID,
-        help="Example model id: amazon.nova-lite-v1:0  |  Or full ARN: arn:aws:bedrock:us-east-1::foundation-model/..."
+    st.title("🛠️ Ops Copilot")
+    st.caption("Local RAG (FAISS) + Ollama/Bedrock (answers)")
+
+    with st.sidebar:
+        st.header("Settings")
+        st.write("Loaded from `.env` (restart app after changes).")
+        st.code(settings.safe_dump(), language="yaml")
+        st.divider()
+        debug = st.checkbox("Show debug (prompt, raw hits)", value=False)
+        top_k = st.slider("Top-K retrieval", 1, 10, settings.top_k)
+
+    question = st.text_input(
+        "Ask a question about your runbooks:",
+        placeholder="e.g., What should I check when RDS CPU spikes above 80%?",
     )
-    max_results = st.slider("Retrieved chunks", min_value=1, max_value=10, value=5)
+    ask = st.button("Ask", type="primary", disabled=not question.strip())
 
-question = st.text_area(
-    "Your question",
-    placeholder="Example: ALB returning 5xx after deployment — what should I check first?",
-    height=120
-)
-
-def _to_model_arn(region: str, model_id_or_arn: str) -> str:
-    """Accept either a full ARN or a model id and return a modelArn."""
-    s = (model_id_or_arn or "").strip()
-    if s.startswith("arn:aws:bedrock:"):
-        return s
-    # Convert model id to foundation-model ARN
-    return f"arn:aws:bedrock:{region}::foundation-model/{s}"
-
-def retrieve_and_generate(region: str, kb_id: str, model_id_or_arn: str, q: str, k: int):
-    client = boto3.client("bedrock-agent-runtime", region_name=region)
-
-    payload = {
-        "input": {"text": q},
-        "retrieveAndGenerateConfiguration": {
-            "type": "KNOWLEDGE_BASE",
-            "knowledgeBaseConfiguration": {
-                "knowledgeBaseId": kb_id,
-                "modelArn": _to_model_arn(region, model_id_or_arn),
-                "retrievalConfiguration": {
-                    "vectorSearchConfiguration": {"numberOfResults": k}
-                },
-            },
-        },
-    }
-    return client.retrieve_and_generate(**payload)
-
-def render_citations(resp: dict):
-    citations = resp.get("citations", [])
-    if not citations:
-        st.info("No citations returned. (KB may not be synced yet, or retrieval returned no matches.)")
+    if not ask:
         return
 
-    st.subheader("Citations")
-    for ci, c in enumerate(citations, start=1):
-        refs = c.get("retrievedReferences", [])
-        if not refs:
-            continue
-        st.markdown(f"**Citation {ci}**")
-        for r in refs:
-            loc = r.get("location", {})
-            s3loc = (loc.get("s3Location") or {})
-            uri = s3loc.get("uri", "")
-            excerpt = ((r.get("content") or {}).get("text") or "").strip()
+    with st.spinner("Embedding + retrieving…"):
+        q_emb = embed_text(question, model_name=settings.embed_model)
+        hits, conf = retrieve(question, q_emb, index_dir=settings.index_dir, top_k=top_k)
+        hits = filter_hits_by_query(question, hits)
 
-            if uri:
-                st.write(f"- Source: `{uri}`")
-            if excerpt:
-                st.code(excerpt[:900])
-
-col1, col2 = st.columns([1, 1])
-with col1:
-    ask_btn = st.button("Ask", type="primary")
-with col2:
-    show_raw = st.toggle("Show raw response", value=False)
-
-if ask_btn:
-    q = (question or "").strip()
-    if not kb_id.strip():
-        st.error("KB_ID is required (sidebar).")
-        st.stop()
-    if not q:
-        st.error("Please enter a question.")
-        st.stop()
-
-    with st.spinner("Retrieving runbook context and generating answer..."):
-        try:
-            resp = retrieve_and_generate(
-                region=aws_region.strip(),
-                kb_id=kb_id.strip(),
-                model_id_or_arn=model_id_or_arn.strip(),
-                q=q,
-                k=max_results,
-            )
-        except ClientError as e:
-            st.error(f"AWS error: {e.response.get('Error', {}).get('Message', str(e))}")
-            st.stop()
-        except Exception as e:
-            st.error(f"Request failed: {e}")
-            st.stop()
-
-    answer = (resp.get("output") or {}).get("text", "").strip()
     st.subheader("Answer")
-    st.write(answer if answer else "_No answer returned._")
+    st.metric("Confidence", f"{conf}/100")
 
-    render_citations(resp)
+    prompt, context_used = build_prompt(question, hits, max_context_chars=settings.max_context_chars)
 
-    if show_raw:
-        st.subheader("Raw response")
-        st.code(json.dumps(resp, indent=2)[:6000])
+    with st.spinner("Generating answer…"):
+        answer = generate_answer(prompt=prompt, hits=hits, provider=settings.llm_provider, settings_override=settings)
 
-st.divider()
-st.caption("Tip: For portfolio projects, deploy → demo → screenshot → delete KB/vector store to avoid ongoing costs.")
+    st.write(answer)
+
+    with st.expander("Retrieved context"):
+        st.markdown(format_sources_markdown(hits))
+
+    if debug:
+        with st.expander("Debug: prompt"):
+            st.code(prompt, language="text")
+        with st.expander("Debug: context length"):
+            st.write(f"{len(context_used)} chars used")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,20 @@
+{
+  "version": "0",
+  "id": "11111111-1111-1111-1111-111111111111",
+  "detail-type": "CloudWatch Alarm State Change",
+  "source": "aws.cloudwatch",
+  "account": "account_id",
+  "time": "2026-02-23T05:02:00Z",
+  "region": "us-east-1",
+  "resources": [],
+  "detail": {
+    "alarmName": "ecs-rollback-demo",
+    "state": {
+      "value": "ALARM",
+      "reason": "Demo alarm to test approval + rollback path."
+    }
+  },
+  "cluster": "ops-copilot-demo-cluster",
+  "service": "ops-copilot-demo-service",
+  "previous_task_definition": "ops-copilot-demo:1"
+}
